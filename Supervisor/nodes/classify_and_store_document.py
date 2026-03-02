@@ -36,11 +36,16 @@ def _get_classifier():
     return classify_document
 
 
+# Module-level MongoDB client (reused across calls to avoid connection leaks)
+_mongo_client = None
+
 def _get_mongo_collection():
     """Get the MongoDB collection used for document storage."""
-    mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-    client = MongoClient(mongo_uri)
-    db = client["Rag"]
+    global _mongo_client
+    if _mongo_client is None:
+        mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+        _mongo_client = MongoClient(mongo_uri)
+    db = _mongo_client["Rag"]
     return db["Document Storage"]
 
 
