@@ -41,6 +41,9 @@ class SupervisorState(TypedDict):
     retry_count: int                          # Current retry attempt
     max_retries: int                          # Default 2
 
+    # -- Document Classification --
+    document_classifications: List[Dict[str, Any]]  # Classification results per document
+
     # -- Output --
     merged_response: str                      # Combined response from all agents
     final_response: str                       # Validated, formatted final answer

@@ -7,6 +7,7 @@ from Supervisor.nodes.validate_output import validate_output_node
 from Supervisor.nodes.update_memory import update_memory_node
 from Supervisor.nodes.off_topic import off_topic_response_node
 from Supervisor.nodes.fallback import fallback_response_node
+from Supervisor.nodes.classify_and_store_document import classify_and_store_document_node
 
 __all__ = [
     "classify_intent_node",
@@ -16,4 +17,5 @@ __all__ = [
     "update_memory_node",
     "off_topic_response_node",
     "fallback_response_node",
+    "classify_and_store_document_node",
 ]

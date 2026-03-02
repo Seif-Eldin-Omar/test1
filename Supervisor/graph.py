@@ -14,6 +14,7 @@ from langgraph.graph import END, START, StateGraph
 
 from Supervisor.config import MAX_RETRIES
 from Supervisor.nodes.classify_intent import classify_intent_node
+from Supervisor.nodes.classify_and_store_document import classify_and_store_document_node
 from Supervisor.nodes.dispatch_agents import dispatch_agents_node
 from Supervisor.nodes.fallback import fallback_response_node
 from Supervisor.nodes.merge_responses import merge_responses_node
@@ -37,6 +38,27 @@ def intent_router(state: SupervisorState) -> str:
     if intent == "off_topic":
         return "off_topic"
     return "dispatch"
+
+
+def post_dispatch_router(state: SupervisorState) -> str:
+    """Route after agent dispatch.
+
+    Returns ``"classify_document"`` when OCR was run or files were
+    uploaded (so documents need classification before storage),
+    or ``"merge"`` to skip straight to response merging.
+    """
+    target_agents = state.get("target_agents", [])
+    uploaded_files = state.get("uploaded_files", [])
+
+    # If OCR was one of the dispatched agents, classify the output
+    if "ocr" in target_agents:
+        return "classify_document"
+
+    # If files were uploaded but no OCR (e.g. text files), still classify
+    if uploaded_files:
+        return "classify_document"
+
+    return "merge"
 
 
 def validation_router(state: SupervisorState) -> str:
@@ -70,6 +92,7 @@ def build_supervisor_graph() -> StateGraph:
     # -- Nodes --
     workflow.add_node("classify_intent", classify_intent_node)
     workflow.add_node("dispatch_agents", dispatch_agents_node)
+    workflow.add_node("classify_and_store_document", classify_and_store_document_node)
     workflow.add_node("merge_responses", merge_responses_node)
     workflow.add_node("validate_output", validate_output_node)
     workflow.add_node("update_memory", update_memory_node)
@@ -88,7 +111,18 @@ def build_supervisor_graph() -> StateGraph:
         },
     )
 
-    workflow.add_edge("dispatch_agents", "merge_responses")
+    # After dispatch, classify documents if OCR ran or files were uploaded,
+    # otherwise go straight to merge.
+    workflow.add_conditional_edges(
+        "dispatch_agents",
+        post_dispatch_router,
+        {
+            "classify_document": "classify_and_store_document",
+            "merge": "merge_responses",
+        },
+    )
+
+    workflow.add_edge("classify_and_store_document", "merge_responses")
     workflow.add_edge("merge_responses", "validate_output")
 
     workflow.add_conditional_edges(
