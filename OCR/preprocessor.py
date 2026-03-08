@@ -123,18 +123,170 @@ def check_and_upscale_resolution(image: Image.Image) -> Image.Image:
 
 def deskew(image: Image.Image) -> Image.Image:
     """
-    Detect and correct document rotation using Hough line transform.
+    Detect and correct document rotation using multiple complementary methods.
 
-    Handles small rotations typical of scanned documents (up to ~15 degrees).
-    Surya handles minor skew but large rotations need correction.
+    Photographed documents are often slightly tilted. This function detects
+    the skew direction and magnitude using three independent approaches,
+    then combines them for a robust angle estimate:
+
+    1. **Hough Line Transform** -- detects dominant line angles from text
+       baselines and page edges.
+    2. **Projection Profile Analysis** -- finds the rotation angle that
+       maximises horizontal projection variance (sharpest text lines).
+    3. **minAreaRect fallback** -- uses the bounding rectangle of dark
+       pixels when the other methods don't produce a clear result.
+
+    Handles rotations up to ~15 degrees in either direction.
+
+    Args:
+        image: PIL Image to deskew.
+
+    Returns:
+        Rotated PIL Image with white fill for new border pixels.
     """
-    # Convert to grayscale numpy array for OpenCV processing
     gray = np.array(image.convert("L"))
 
-    coords = np.column_stack(np.where(gray < 128))
+    angle_hough = _detect_skew_hough(gray)
+    angle_proj = _detect_skew_projection_profile(gray)
+    angle_rect = _detect_skew_min_area_rect(gray)
 
-    if len(coords) < 50:
+    candidates = [a for a in (angle_hough, angle_proj, angle_rect) if a is not None]
+
+    if not candidates:
         return image
+
+    # When we have multiple estimates, take the median for robustness
+    # against outliers from any single method.
+    angle = float(np.median(candidates))
+
+    if abs(angle) > 15 or abs(angle) < 0.1:
+        return image
+
+    logger.info(
+        "Deskewing by %.2f° (hough=%.2f, projection=%.2f, rect=%.2f)",
+        angle,
+        angle_hough if angle_hough is not None else float("nan"),
+        angle_proj if angle_proj is not None else float("nan"),
+        angle_rect if angle_rect is not None else float("nan"),
+    )
+    return image.rotate(
+        -angle, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255)
+    )
+
+
+# ------------------------------------------------------------------
+# Skew detection helpers
+# ------------------------------------------------------------------
+
+
+def _detect_skew_hough(gray: np.ndarray, max_angle: float = 15.0):
+    """
+    Detect skew angle using Probabilistic Hough Line Transform.
+
+    Finds near-horizontal lines (text baselines, ruled lines) and
+    computes their median angle relative to horizontal.
+
+    Returns:
+        Estimated skew angle in degrees, or None if not enough lines.
+    """
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
+
+    # Dilate horizontally to emphasise text baselines
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1))
+    edges = cv2.dilate(edges, kernel, iterations=1)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=100,
+        minLineLength=gray.shape[1] // 8,
+        maxLineGap=20,
+    )
+
+    if lines is None or len(lines) < 3:
+        return None
+
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        dx = x2 - x1
+        dy = y2 - y1
+        if abs(dx) < 1:
+            continue
+        angle_deg = math.degrees(math.atan2(dy, dx))
+        if abs(angle_deg) <= max_angle:
+            angles.append(angle_deg)
+
+    if len(angles) < 3:
+        return None
+
+    return float(np.median(angles))
+
+
+def _detect_skew_projection_profile(
+    gray: np.ndarray,
+    angle_range: float = 10.0,
+    angle_step: float = 0.25,
+):
+    """
+    Detect skew angle via projection profile analysis.
+
+    For each candidate angle, rotate the image and compute the
+    horizontal projection (row-wise sum of dark pixels). The correct
+    angle produces the sharpest text lines, which shows up as the
+    highest variance in the projection profile.
+
+    To keep things fast, operates on a downscaled version of the image.
+
+    Returns:
+        Estimated skew angle in degrees, or None on failure.
+    """
+    # Downscale for speed
+    scale = 600 / max(gray.shape)
+    if scale < 1.0:
+        small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    else:
+        small = gray
+
+    _, binary = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    best_angle = 0.0
+    best_variance = 0.0
+    h, w = binary.shape
+
+    angles = np.arange(-angle_range, angle_range + angle_step, angle_step)
+    for angle in angles:
+        rot_mat = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+        rotated = cv2.warpAffine(
+            binary, rot_mat, (w, h), flags=cv2.INTER_NEAREST, borderValue=0
+        )
+        row_sums = np.sum(rotated, axis=1).astype(np.float64)
+        variance = np.var(row_sums)
+        if variance > best_variance:
+            best_variance = variance
+            best_angle = angle
+
+    if best_variance == 0:
+        return None
+
+    # The rotation that maximises variance is the deskew correction,
+    # so the detected skew is the negative of that.
+    return float(-best_angle)
+
+
+def _detect_skew_min_area_rect(gray: np.ndarray):
+    """
+    Detect skew angle using the minimum-area bounding rectangle of
+    dark pixels. Simple fallback method.
+
+    Returns:
+        Estimated skew angle in degrees, or None if insufficient dark pixels.
+    """
+    coords = np.column_stack(np.where(gray < 128))
+    if len(coords) < 50:
+        return None
 
     angle = cv2.minAreaRect(coords)[-1]
 
@@ -144,13 +296,10 @@ def deskew(image: Image.Image) -> Image.Image:
     else:
         angle = -angle
 
-    # Only correct if angle is small (large angles likely mean
-    # the document is intentionally rotated, not skewed)
-    if abs(angle) > 15 or abs(angle) < 0.1:
-        return image
+    if abs(angle) > 15:
+        return None
 
-    logger.info("Deskewing by %.2f degrees", angle)
-    return image.rotate(-angle, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
+    return float(angle)
 
 
 def remove_borders(image: Image.Image) -> Image.Image:
